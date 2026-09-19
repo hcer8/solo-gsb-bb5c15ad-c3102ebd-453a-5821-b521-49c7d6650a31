@@ -107,6 +107,60 @@ class LeaderboardPageOut(BaseModel):
     )
 
 
+class MerkleProofStepOut(BaseModel):
+    """One sibling node on a leaf-to-root Merkle path, bottom-up."""
+
+    level: int = Field(
+        description="Layer of the sibling node; 0 is the leaf layer."
+    )
+    position: Literal["left", "right", "self"] = Field(
+        description=(
+            "Where the sibling sits relative to the running hash: left means "
+            "parent = SHA256(0x01 || sibling || running), right means "
+            "parent = SHA256(0x01 || running || sibling); self marks the "
+            "duplicated last node of an odd layer (running pairs with itself)."
+        )
+    )
+    sibling: str = Field(description="Sibling node digest as lowercase hex.")
+
+
+class LeaderboardCommitmentOut(BaseModel):
+    """Leaf count and Merkle root committing one leaderboard snapshot."""
+
+    revision: int = Field(
+        description="Snapshot revision; 0 means the empty leaderboard."
+    )
+    leaf_count: int = Field(
+        description="Number of committed leaves (participants); 0 for the empty leaderboard."
+    )
+    root_hash: str = Field(
+        description=(
+            "Merkle root digest as lowercase hex. The empty leaderboard root "
+            "is fixed at SHA-256 of the empty byte string."
+        )
+    )
+
+
+class LeaderboardProofOut(BaseModel):
+    """Inclusion proof for one entry within a leaderboard commitment."""
+
+    revision: int = Field(description="Snapshot revision the proof was built on.")
+    leaf_index: int = Field(
+        ge=0,
+        description="Zero-based leaf index, equal to entry.rank - 1.",
+    )
+    entry: LeaderboardEntry = Field(
+        description="The committed leaderboard entry (rank, participant_id, total_points, effective_events)."
+    )
+    proof: List[MerkleProofStepOut] = Field(
+        description="Sibling nodes from the leaf layer up, in hash order; empty for a single-leaf tree."
+    )
+    root_hash: str = Field(
+        description="Root digest the proof recomputes to (same value as GET /leaderboard/commitment)."
+    )
+    leaf_count: int = Field(description="Number of leaves in the committed tree.")
+
+
 class RankPosition(BaseModel):
     """A participant's rank and total at one snapshot revision."""
 

@@ -11,6 +11,7 @@
 - **奖励结算预演**：`POST /rewards/preview` 按指定 revision 的排行榜只读试算奖金分配——并列组共享合并后的奖金池、余数按 `participant_id` 升序分配，不写入账本。
 - **更正分叉审计**：`GET /audit/correction-forks?revision=` 按指定快照还原更正关系，仅返回存在分叉（同一事件被两个及以上事件直接更正）的更正链，列出根到各生效叶子的完整路径与按参赛者汇总的生效积分；只读，普通线性链不返回。
 - **积分阈值区间**：`GET /participants/{participant_id}/threshold-intervals` 逐 revision 重算单个参赛者的真实生效总分，把"总分 ≥ 阈值"的连续 revision 合并为闭区间，返回区间起止与两端积分；更正链分叉、跨参赛者更正造成的升降都会体现，未出现的参赛者按 0 分处理。
+- **排行榜快照承诺**：`GET /leaderboard/commitment?revision=` 对榜单按序做确定性编码（rank、participant_id、total_points、生效 event_id 列表），构建 SHA-256 Merkle 树并返回叶数与根摘要；`GET /leaderboard/proof/{participant_id}?revision=` 返回条目、叶索引与逐层兄弟节点，客户端可独立复算同一根。奇数层末节点与自身配对，单叶树根即叶哈希，空榜根固定为 `SHA256("")`，缺席参赛者返回 404。历史快照只依赖该 revision 及之前的事件，不受后续写入影响。
 - **并发安全**：写入经 `BEGIN IMMEDIATE` 串行化，revision 在写锁内分配——并发写入（含批量）不会产生重复 revision 或中间态。
 
 ## 快速启动
@@ -255,6 +256,74 @@ curl 'localhost:8000/leaderboard/page?limit=2&cursor=<next_cursor>'
 - 排序与 `/leaderboard` 一致（总分降序、`participant_id` 升序），`rank` 跨页连续。
 - 末页 `next_cursor` 为 `null`；空榜正常返回 `{"revision": 0, "entries": [], "next_cursor": null}`。
 - 游标格式为 `base64url(payload).base64url(HMAC-SHA256)`，payload 含版本号、revision、末条总分与 `participant_id`；篡改、格式错误、版本不支持或与显式 `revision` 冲突均返回 `422`，未知 revision 返回 `404`。
+
+### 排行榜快照承诺与默克尔证明 `GET /leaderboard/commitment`、`GET /leaderboard/proof/{participant_id}`
+
+对指定 revision 的排行榜快照做确定性编码并构建 **SHA-256 Merkle 树**，返回叶数与根摘要；任一参赛者的包含证明（条目 + 叶索引 + 逐层兄弟节点）可让客户端独立复算出同一根。纯读：历史快照只依赖 `revision ≤ R` 的行，后续写入不会改变既有 revision 的承诺。
+
+```bash
+# 快照承诺（revision 可省略，默认当前；revision=0 表示空榜）
+curl 'localhost:8000/leaderboard/commitment?revision=3'
+
+# 某参赛者的包含证明
+curl 'localhost:8000/leaderboard/proof/alice?revision=3'
+```
+
+```json
+// GET /leaderboard/commitment?revision=3
+{"revision": 3, "leaf_count": 3, "root_hash": "629e2fd7d49e1d04c7e7c40d028082fb2ff73e6ae1f14b7da9d39239538c7b2f"}
+```
+
+```json
+// GET /leaderboard/proof/bob?revision=3
+{
+  "revision": 3,
+  "leaf_index": 2,
+  "entry": {
+    "rank": 3,
+    "participant_id": "bob",
+    "total_points": 7,
+    "effective_events": [
+      {"event_id": "m2", "points": 7, "revision": 2, "correction_of": null}
+    ]
+  },
+  "proof": [
+    {"level": 0, "position": "self",  "sibling": "591579e394d3da72a15857d1d0a3b5ef81245d0a390144e6ee3b4e5dd0195d2c"},
+    {"level": 1, "position": "left",  "sibling": "382d8010c596b3266eb3a523ca8d35dca2fb4e94417d6610cabe95c18630ec23"}
+  ],
+  "root_hash": "629e2fd7d49e1d04c7e7c40d028082fb2ff73e6ae1f14b7da9d39239538c7b2f",
+  "leaf_count": 3
+}
+```
+
+#### 确定性编码规则
+
+1. **叶顺序**：与 `GET /leaderboard` 完全一致——总分降序、`participant_id` 升序；叶索引从 0 开始，等于 `rank - 1`。
+2. **叶载荷**：每个条目编码为规范化 JSON（UTF-8；键按字典序；无空白），含且仅含四个字段：
+
+   ```json
+   {"event_ids":["m2"],"participant_id":"bob","rank":3,"total_points":7}
+   ```
+
+   `event_ids` 是该参赛者的**生效** `event_id` 列表，按 revision 升序（空列表时为 `[]`）。多字节字符以原样 UTF-8 出现（不做 `\uXXXX` 转义）。
+3. **叶哈希**：`SHA256(0x00 || 叶载荷)`（单字节前缀 `0x00` 做域分离）。
+4. **内部节点**：`SHA256(0x01 || 左孩子 || 右孩子)`，孩子均为 32 字节原始摘要。
+5. **奇数层**：该层最后一个节点没有右兄弟时**与自身配对**（证明中对应 `position: "self"`，兄弟摘要即节点自身）。
+6. **根**：逐层向上直到只剩一个节点；**单叶树的根就是该叶哈希本身**（`proof` 为空数组）。
+7. **空榜**：叶数为 0，根固定为 **SHA-256（空字节串）**，即 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`；空榜下任何参赛者的证明均为 `404`。
+8. 所有摘要均以小写十六进制输出（32 字节 → 64 个 hex 字符）。
+
+#### 客户端复算与语义
+
+- 从 `entry` 按规则 2、3 算出叶哈希，置 `idx = leaf_index`；自底向上遍历 `proof`：
+  - `position: "left"`（此时 `idx` 为奇数）：`h = SHA256(0x01 || sibling || h)`；
+  - `position: "right"`（此时 `idx` 为偶数）：`h = SHA256(0x01 || h || sibling)`；
+  - `position: "self"`：`h = SHA256(0x01 || h || h)`；
+  - 每上一层 `idx = floor(idx / 2)`。最终 `h` 必须等于响应中的 `root_hash`，也等于同 revision 调用 `/leaderboard/commitment` 的 `root_hash`。
+- `proof[].level` 为兄弟节点所在层（叶层为 0），数组按层升序；`sibling` 为兄弟节点的小写 hex 摘要。
+- 两个接口对**相同 revision** 必然一致（同一快照同一棵树）；`leaf_count` 等于该 revision 排行榜条目数。
+- 参赛者在该 revision 没有条目（尚未出现、或积分事件已被更正改挂给他人）返回 `404`；`revision` 超出当前最大 revision 返回 `404`；缺失/非整数/负数 `revision` 返回 `422`。
+- 承诺只固定**生效状态**：同一参与者后续事件被更正后，其叶载荷中的 `event_ids`、总分、名次都会变化，根随之改变；但任一历史 revision 的根保持不变。
 
 ### 名次变化 `GET /leaderboard/changes`
 
@@ -626,7 +695,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest -v
 ```
 
-测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空账本对比、更正合并为 `replaced`、链分叉记 `added`、非一进一出不合并、before/after 完整事件、按链根排序、参数顺序 422、超范围 404、路由不被 `/events/{event_id}` 遮蔽），`/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续），以及 `/participants/{participant_id}/score-breakdown`（空账本与未知参赛者返回 0 与空数组、更正链只计末端且 history 完整、历史 revision 固定快照、revision 0 空快照、更正转移后旧参赛者不再保留该链而新归属者 history 展示此前归属、按链根升序、分叉链每末端各成一项、总分与 `/leaderboard` 一致、默认取当前 revision、负数 422、超范围 404），以及 `/participants/compare`（区间合并与边界、子范围与 `from == to`、更正改挂在同一 revision 双方同时变动、更正链只计末端、分叉链只扣一次、双方无分/未知参赛者返回覆盖全范围的 tie、双方同一人恒为 tie、空账本 0→0、区间无缝覆盖整个范围、逐 revision 与 `/leaderboard` 总分一致、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、字面路由不被遮蔽），以及 `/participants/{participant_id}/threshold-intervals`（区间合并与边界含等号、区间两端积分可不同、子范围与 `from == to`、阈值为负/0 与 revision 0、未出现参赛者按 0 分、跨参赛者更正使旧归属方跌出新归属方升入、更正链只计末端、分叉链各分支叶子均计且共享祖先只扣一次、逐 revision 与 `/leaderboard` 总分一致、区间按起点升序、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、查询只读不写账本），以及 `/rewards/preview`（空账本返回空获奖者、按名次发奖、并列组合并奖金池均分、余数分币按 `participant_id` 升序分配且总额守恒、组跨有奖区边界只合并区内名次、区外组不获奖、0 奖金名次仍在区内、指定历史 revision 快照、更正链只计末端、越界 revision 返回 404、奖金数组 1～100 个非负整数校验 422、预演不写入账本），以及 `/audit/correction-forks`（空账本与 revision 0 返回空、普通线性链与独立事件不返回、分叉列出各分支根到生效叶子的完整路径、分叉后的链式更正归入各自分支、非根节点分叉与多个分叉点共享链根、按参赛者汇总生效积分且被取代节点不计、历史 revision 固定快照、分叉形成前后的快照差异、`chain_root` 与叶子 `(revision, event_id)` 稳定排序、批量写入的分叉可见、默认最新、超范围 404、负数/非整数 422、只读不写账本），以及 `/events/preview`（空账本基线推演、虚拟 revision 与草案生效明细、基线固定快照忽略后续账本事件、base_revision 0 忽略全账本、草案更正基线事件只计末端、批内草案链式更正、草案分叉基线链保留各分支叶子、更正改挂产生退出/进入、并列按 `participant_id` 排序且名次连续、仅名次变化与无变化空 changes、与基线及基线后账本事件重名 409、409 先于 422、引用后续草案/未知事件/基线后账本事件/自引用 422、批内重复 422、越界基线 404、负数/非整数/缺参 422、草案条数 1～100 校验、预演不写库不耗 revision、推演结果与真实写入后的 `/leaderboard` 及 `/leaderboard/changes` 一致）。
+测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空账本对比、更正合并为 `replaced`、链分叉记 `added`、非一进一出不合并、before/after 完整事件、按链根排序、参数顺序 422、超范围 404、路由不被 `/events/{event_id}` 遮蔽），`/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续），以及 `/participants/{participant_id}/score-breakdown`（空账本与未知参赛者返回 0 与空数组、更正链只计末端且 history 完整、历史 revision 固定快照、revision 0 空快照、更正转移后旧参赛者不再保留该链而新归属者 history 展示此前归属、按链根升序、分叉链每末端各成一项、总分与 `/leaderboard` 一致、默认取当前 revision、负数 422、超范围 404），以及 `/participants/compare`（区间合并与边界、子范围与 `from == to`、更正改挂在同一 revision 双方同时变动、更正链只计末端、分叉链只扣一次、双方无分/未知参赛者返回覆盖全范围的 tie、双方同一人恒为 tie、空账本 0→0、区间无缝覆盖整个范围、逐 revision 与 `/leaderboard` 总分一致、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、字面路由不被遮蔽），以及 `/participants/{participant_id}/threshold-intervals`（区间合并与边界含等号、区间两端积分可不同、子范围与 `from == to`、阈值为负/0 与 revision 0、未出现参赛者按 0 分、跨参赛者更正使旧归属方跌出新归属方升入、更正链只计末端、分叉链各分支叶子均计且共享祖先只扣一次、逐 revision 与 `/leaderboard` 总分一致、区间按起点升序、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、查询只读不写账本），以及 `/rewards/preview`（空账本返回空获奖者、按名次发奖、并列组合并奖金池均分、余数分币按 `participant_id` 升序分配且总额守恒、组跨有奖区边界只合并区内名次、区外组不获奖、0 奖金名次仍在区内、指定历史 revision 快照、更正链只计末端、越界 revision 返回 404、奖金数组 1～100 个非负整数校验 422、预演不写入账本），以及 `/audit/correction-forks`（空账本与 revision 0 返回空、普通线性链与独立事件不返回、分叉列出各分支根到生效叶子的完整路径、分叉后的链式更正归入各自分支、非根节点分叉与多个分叉点共享链根、按参赛者汇总生效积分且被取代节点不计、历史 revision 固定快照、分叉形成前后的快照差异、`chain_root` 与叶子 `(revision, event_id)` 稳定排序、批量写入的分叉可见、默认最新、超范围 404、负数/非整数 422、只读不写账本），以及 `/events/preview`（空账本基线推演、虚拟 revision 与草案生效明细、基线固定快照忽略后续账本事件、base_revision 0 忽略全账本、草案更正基线事件只计末端、批内草案链式更正、草案分叉基线链保留各分支叶子、更正改挂产生退出/进入、并列按 `participant_id` 排序且名次连续、仅名次变化与无变化空 changes、与基线及基线后账本事件重名 409、409 先于 422、引用后续草案/未知事件/基线后账本事件/自引用 422、批内重复 422、越界基线 404、负数/非整数/缺参 422、草案条数 1～100 校验、预演不写库不耗 revision、推演结果与真实写入后的 `/leaderboard` 及 `/leaderboard/changes` 一致），以及 `/leaderboard/commitment` 与 `/leaderboard/proof/{participant_id}`（空榜根固定为 `SHA256("")` 且叶数为 0、空榜任何参赛者 404、叶序等于排名顺序、叶数与 revision 字段、默认取最新 revision、叶索引等于 rank-1、proof 的 entry 与 `/leaderboard` 一致、用独立实现的编码逐层复算每个参赛者的根、奇数层末节点与自身配对（3/5 叶）、各 `position`（left/right/self）与层级兄弟摘要布局、单叶树根即叶哈希且 proof 为空、两叶树无 self 步、UTF-8 参赛者 ID 的载荷编码、缺席/未出生参赛者 404、更正后生效 event_id 与根变化、历史快照在后续写入（含更正改挂）后根与证明保持不变、每个 revision 两接口一致、超范围 404 与负数/非整数 422）。
 
 ## 设计要点
 
@@ -643,3 +712,4 @@ pytest -v
 - **情景预演**：`/events/preview` 在单个读快照内取出 `revision ≤ base_revision` 的基线事件，与草案事件（虚拟 revision 为 `base_revision + 数组下标 + 1`）合并后套用账本同一生效判定——被任一后续事件（含草案）更正的事件不计，分叉链各分支叶子均计；聚合、排序、名次与 `changes` 差异计算直接复用 `/leaderboard` 与 `/leaderboard/changes` 的实现。校验顺序：基线越界 404 → 草案 `event_id` 与账本任意事件重名 409 → 非法引用 422。全程只读：不开写事务、不插入事件、不消耗 revision。
 - **并发**：所有写操作在 `BEGIN IMMEDIATE` 事务内先取写锁、再计算 `MAX(revision)+1` 并插入（批量为一段连续块），配合 `busy_timeout`，写者完全串行；读者走 WAL 快照，互不阻塞。
 - **游标分页**：`/leaderboard/page` 的游标经 HMAC-SHA256 签名（密钥来自 `LEADERBOARD_CURSOR_SECRET`），绑定 revision 与末条排序键 `(total_points, participant_id)`；续读始终落在游标指定的 revision 上，配合 WAL 快照读，写入并发进行也不会造成分页漂移。
+- **快照承诺**：`/leaderboard/commitment` 与 `/leaderboard/proof/{participant_id}` 在同一个只读快照事务内复用 `/leaderboard` 的生效判定（`revision ≤ R` 且未被快照内更正取代）、`(-total_points, participant_id)` 排序与连续名次生成条目；叶载荷为规范化 JSON（键排序、无空白、UTF-8，含 `rank`/`participant_id`/`total_points`/按 revision 升序的生效 `event_ids`），叶哈希与内部节点分别以 `0x00`/`0x01` 前缀域分离。奇数层末节点与自身配对，单叶树根即叶哈希，空树根固定为 `SHA256("")`。证明自叶层向上给出兄弟摘要与相对位置（left/right/self），两接口对同一 revision 构建同一棵树；所有输入行都由 revision 上界固定，历史承诺不受后续写入影响。纯读：只开只读事务，不写账本、不消耗 revision。

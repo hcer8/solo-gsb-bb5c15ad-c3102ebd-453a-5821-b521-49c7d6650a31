@@ -10,6 +10,7 @@ from typing import Mapping, Optional, Tuple, Union
 
 from fastapi import HTTPException
 
+from . import commitment
 from .cursor import decode_cursor, encode_cursor
 from .db import read_tx, write_tx
 from .schemas import (
@@ -28,9 +29,12 @@ from .schemas import (
     EventPreviewOut,
     LeaderboardChangeOut,
     LeaderboardChangesOut,
+    LeaderboardCommitmentOut,
     LeaderboardEntry,
     LeaderboardOut,
     LeaderboardPageOut,
+    LeaderboardProofOut,
+    MerkleProofStepOut,
     ParticipantCompareOut,
     RankPosition,
     RewardPreviewIn,
@@ -419,6 +423,137 @@ def leaderboard(revision: Optional[int] = None) -> LeaderboardOut:
 
     ordered, details = _aggregate(rows)
     return _leaderboard_out(revision, ordered, details)
+
+
+def _resolve_snapshot_revision(
+    conn: sqlite3.Connection, revision: Optional[int]
+) -> int:
+    """Resolve a snapshot revision that also accepts 0 (empty leaderboard).
+
+    Mirrors :func:`_resolve_revision` for revisions >= 1; ``None`` defaults
+    to the current maximum (0 on the empty ledger). A revision beyond the
+    current maximum is 404; negatives are rejected at the API layer (422).
+    """
+    max_rev = conn.execute(
+        "SELECT COALESCE(MAX(revision), 0) FROM events"
+    ).fetchone()[0]
+    if revision is None:
+        return max_rev
+    if revision < 0 or revision > max_rev:
+        raise HTTPException(status_code=404, detail=f"revision {revision} not found")
+    return revision
+
+
+def _snapshot_entries(
+    conn: sqlite3.Connection, revision: int
+) -> list[LeaderboardEntry]:
+    """Full ranked leaderboard entries as of ``revision`` (0 = empty)."""
+    if revision == 0:
+        return []
+    ordered, details = _aggregate(_effective_rows(conn, revision))
+    return [
+        LeaderboardEntry(
+            rank=i + 1,
+            participant_id=pid,
+            total_points=total,
+            effective_events=details[pid],
+        )
+        for i, (pid, total) in enumerate(ordered)
+    ]
+
+
+def _commitment_leaves(entries: list[LeaderboardEntry]) -> list[bytes]:
+    """Deterministic leaf digests in leaderboard (rank) order.
+
+    Effective event_ids preserve ``_effective_rows`` order: per participant,
+    revision ascending.
+    """
+    return [
+        commitment.leaf_digest(
+            rank=entry.rank,
+            participant_id=entry.participant_id,
+            total_points=entry.total_points,
+            event_ids=[ev.event_id for ev in entry.effective_events],
+        )
+        for entry in entries
+    ]
+
+
+def leaderboard_commitment(revision: Optional[int]) -> LeaderboardCommitmentOut:
+    """SHA-256 Merkle commitment over the leaderboard at ``revision``.
+
+    Leaves follow the same order as ``GET /leaderboard`` (total_points
+    descending, participant_id ascending) and encode each entry's rank,
+    participant_id, total_points and effective event_ids, so the root pins
+    the whole snapshot. The empty leaderboard (revision 0, or the default on
+    an empty ledger) has the fixed root ``SHA-256(b"")``. Read-only; the
+    result for a past revision never changes under later writes because all
+    input rows are pinned by ``revision <= R``.
+    """
+    with read_tx() as conn:
+        revision = _resolve_snapshot_revision(conn, revision)
+        entries = _snapshot_entries(conn, revision)
+
+    if not entries:
+        return LeaderboardCommitmentOut(
+            revision=revision, leaf_count=0, root_hash=commitment.EMPTY_ROOT_HEX
+        )
+    levels = commitment.build_levels(_commitment_leaves(entries))
+    root = commitment.root_from_levels(levels)
+    return LeaderboardCommitmentOut(
+        revision=revision,
+        leaf_count=len(entries),
+        root_hash=root.hex(),
+    )
+
+
+def leaderboard_proof(
+    participant_id: str, revision: Optional[int]
+) -> LeaderboardProofOut:
+    """Merkle inclusion proof for one participant's entry at ``revision``.
+
+    Rebuilds exactly the same tree as :func:`leaderboard_commitment` for the
+    same revision, so the returned proof recomputes to that endpoint's
+    ``root_hash``. ``leaf_index`` is the zero-based rank (``rank - 1``);
+    the proof lists sibling nodes from the leaf layer upward, including the
+    duplicated-self pairing at every odd layer. A participant absent from
+    the snapshot (or the empty leaderboard) is 404.
+    """
+    with read_tx() as conn:
+        revision = _resolve_snapshot_revision(conn, revision)
+        entries = _snapshot_entries(conn, revision)
+
+    leaf_index = next(
+        (i for i, e in enumerate(entries) if e.participant_id == participant_id),
+        None,
+    )
+    if leaf_index is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"participant '{participant_id}' has no leaderboard entry "
+                f"at revision {revision}"
+            ),
+        )
+
+    levels = commitment.build_levels(_commitment_leaves(entries))
+    steps = commitment.merkle_proof(levels, leaf_index)
+    root = commitment.root_from_levels(levels)
+    return LeaderboardProofOut(
+        revision=revision,
+        leaf_index=leaf_index,
+        entry=entries[leaf_index],
+        proof=[
+            MerkleProofStepOut(
+                level=step.level,
+                position=step.position,
+                sibling=step.sibling.hex(),
+            )
+            for step in steps
+        ],
+        root_hash=root.hex(),
+        leaf_count=len(entries),
+    )
 
 
 def _snapshot(conn: sqlite3.Connection, revision: int) -> dict[str, RankPosition]:
