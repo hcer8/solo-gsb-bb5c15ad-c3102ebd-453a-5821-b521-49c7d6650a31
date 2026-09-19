@@ -107,6 +107,66 @@ class LeaderboardPageOut(BaseModel):
     )
 
 
+class CommitmentEntry(BaseModel):
+    """Deterministic Merkle-leaf payload of one leaderboard entry."""
+
+    rank: int
+    participant_id: str
+    total_points: int
+    event_ids: List[str] = Field(
+        description="Effective event_ids in revision order "
+        "(same order as effective_events in GET /leaderboard)."
+    )
+
+
+class LeaderboardCommitmentOut(BaseModel):
+    revision: int
+    leaf_count: int = Field(
+        description="Number of Merkle leaves, i.e. leaderboard entries; 0 for the empty leaderboard."
+    )
+    root: str = Field(
+        description=(
+            "Hex-encoded SHA-256 Merkle root over the canonically encoded "
+            "entries; SHA-256 of the empty byte string when the leaderboard "
+            "is empty."
+        )
+    )
+
+
+class ProofSibling(BaseModel):
+    """One sibling digest on the path from a leaf up to the Merkle root."""
+
+    position: Literal["left", "right"] = Field(
+        description=(
+            "Which side of the running node this sibling hashes on: "
+            "left -> parent = SHA-256(sibling || node); "
+            "right -> parent = SHA-256(node || sibling)."
+        )
+    )
+    hash: str = Field(description="Hex-encoded SHA-256 digest of the sibling node.")
+
+
+class LeaderboardProofOut(BaseModel):
+    revision: int
+    leaf_count: int
+    leaf_index: int = Field(
+        description="0-based position of the entry on the leaderboard (rank 1 -> index 0)."
+    )
+    entry: CommitmentEntry
+    leaf_hash: str = Field(
+        description="Hex-encoded SHA-256 of the entry's canonical JSON encoding."
+    )
+    siblings: List[ProofSibling] = Field(
+        description="Sibling digests from the leaf level up to (excluding) the root."
+    )
+    root: str = Field(
+        description=(
+            "Hex-encoded Merkle root; identical to GET /leaderboard/commitment "
+            "at the same revision."
+        )
+    )
+
+
 class RankPosition(BaseModel):
     """A participant's rank and total at one snapshot revision."""
 

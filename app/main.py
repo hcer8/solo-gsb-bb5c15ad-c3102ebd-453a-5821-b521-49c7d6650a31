@@ -16,8 +16,10 @@ from .schemas import (
     EventPreviewIn,
     EventPreviewOut,
     LeaderboardChangesOut,
+    LeaderboardCommitmentOut,
     LeaderboardOut,
     LeaderboardPageOut,
+    LeaderboardProofOut,
     ParticipantCompareOut,
     RewardPreviewIn,
     RewardPreviewOut,
@@ -220,6 +222,48 @@ def get_leaderboard_page(
     ),
 ) -> LeaderboardPageOut:
     return ledger.leaderboard_page(revision, limit, cursor)
+
+
+@app.get(
+    "/leaderboard/commitment",
+    response_model=LeaderboardCommitmentOut,
+    responses={
+        404: {"description": "Revision beyond the current maximum"},
+        422: {"description": "Non-integer or negative revision"},
+    },
+)
+def get_leaderboard_commitment(
+    revision: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description="Snapshot revision; defaults to the latest.",
+    ),
+) -> LeaderboardCommitmentOut:
+    return ledger.leaderboard_commitment(revision)
+
+
+@app.get(
+    "/leaderboard/proof/{participant_id}",
+    response_model=LeaderboardProofOut,
+    responses={
+        404: {
+            "description": (
+                "Revision beyond the current maximum, or participant absent "
+                "from the snapshot"
+            )
+        },
+        422: {"description": "Non-integer or negative revision"},
+    },
+)
+def get_leaderboard_proof(
+    participant_id: str,
+    revision: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description="Snapshot revision; defaults to the latest.",
+    ),
+) -> LeaderboardProofOut:
+    return ledger.leaderboard_proof(participant_id, revision)
 
 
 # NOTE: declared before /participants/{participant_id}/... so the literal

@@ -10,6 +10,7 @@ from typing import Mapping, Optional, Tuple, Union
 
 from fastapi import HTTPException
 
+from .commitment import commitment_entry, leaf_digest, merkle_proof, merkle_root
 from .cursor import decode_cursor, encode_cursor
 from .db import read_tx, write_tx
 from .schemas import (
@@ -28,9 +29,11 @@ from .schemas import (
     EventPreviewOut,
     LeaderboardChangeOut,
     LeaderboardChangesOut,
+    LeaderboardCommitmentOut,
     LeaderboardEntry,
     LeaderboardOut,
     LeaderboardPageOut,
+    LeaderboardProofOut,
     ParticipantCompareOut,
     RankPosition,
     RewardPreviewIn,
@@ -419,6 +422,61 @@ def leaderboard(revision: Optional[int] = None) -> LeaderboardOut:
 
     ordered, details = _aggregate(rows)
     return _leaderboard_out(revision, ordered, details)
+
+
+def leaderboard_commitment(revision: Optional[int] = None) -> LeaderboardCommitmentOut:
+    """Merkle commitment over the leaderboard snapshot at ``revision``.
+
+    Leaves are the snapshot entries in leaderboard order, each encoded as
+    canonical JSON and hashed per ``app.commitment``; the empty
+    leaderboard commits to SHA-256 of the empty byte string. Read-only:
+    events are immutable, so a historical revision always yields the same
+    root no matter what is written afterwards.
+    """
+    lb = leaderboard(revision)
+    leaves = [leaf_digest(commitment_entry(e)) for e in lb.entries]
+    return LeaderboardCommitmentOut(
+        revision=lb.revision,
+        leaf_count=len(leaves),
+        root=merkle_root(leaves).hex(),
+    )
+
+
+def leaderboard_proof(
+    participant_id: str, revision: Optional[int] = None
+) -> LeaderboardProofOut:
+    """Merkle inclusion proof for one participant at ``revision``.
+
+    Returns the participant's encoded entry, its 0-based leaf index and
+    the per-level sibling digests, so a client can recompute the root
+    returned by ``/leaderboard/commitment`` for the same revision. A
+    participant absent from the snapshot (never on the board, or all
+    events corrected away to someone else) is a 404.
+    """
+    lb = leaderboard(revision)
+    entries = [commitment_entry(e) for e in lb.entries]
+    leaves = [leaf_digest(e) for e in entries]
+    index = next(
+        (i for i, e in enumerate(entries) if e.participant_id == participant_id),
+        None,
+    )
+    if index is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"participant '{participant_id}' not on the leaderboard "
+                f"at revision {lb.revision}"
+            ),
+        )
+    return LeaderboardProofOut(
+        revision=lb.revision,
+        leaf_count=len(leaves),
+        leaf_index=index,
+        entry=entries[index],
+        leaf_hash=leaves[index].hex(),
+        siblings=merkle_proof(leaves, index),
+        root=merkle_root(leaves).hex(),
+    )
 
 
 def _snapshot(conn: sqlite3.Connection, revision: int) -> dict[str, RankPosition]:
